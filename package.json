@@ -2,8 +2,11 @@
   "name": "lichcongtac-admin-api",
   "version": "1.0.0",
   "private": true,
-  "license": "MIT",
+  "engines": { "node": "18.x" },
+  "scripts": { "start": "node index.js" },
   "dependencies": {
-    "firebase-admin": "^12.0.0"
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "firebase-admin": "^12.5.0"
   }
 }
