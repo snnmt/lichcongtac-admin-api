@@ -28,7 +28,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// logging (đặt gần đầu file, sau app = express())
+// Logging đơn giản
 app.use((req, res, next) => {
   res.on("finish", () => {
     if (req.path !== "/health" && req.path !== "/") {
@@ -38,12 +38,12 @@ app.use((req, res, next) => {
   next();
 });
 
-// HEALTH CHECK endpoints
+// Health check
 app.head("/", (req, res) => res.sendStatus(200));
 app.get("/",  (req, res) => res.status(200).send("OK"));
+app.get("/health", (req, res) => res.json({ ok: true }));
 
-
-// --- API /admin (giữ nguyên logic bạn đang có) ---
+// --- Authz: xác thực admin từ ID token ---
 async function assertAdminFromIdToken(req) {
   const h = req.headers.authorization || "";
   const idToken = h.startsWith("Bearer ") ? h.slice(7) : null;
@@ -57,6 +57,7 @@ async function assertAdminFromIdToken(req) {
   return uid;
 }
 
+// --- Actions ---
 async function handleCreateUser(data) {
   const { email, password, fullName, role, departmentId } = data || {};
   if (!email || !password || !fullName || !role) {
@@ -66,41 +67,61 @@ async function handleCreateUser(data) {
     email, password, displayName: fullName, emailVerified: false, disabled: false,
   });
   const uid = userRecord.uid;
+
   await db.collection("users").doc(uid).set({
     uid, email, fullName, role, departmentId: departmentId || null,
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
   }, { merge: true });
+
+  // set custom claims (nếu muốn)
+  await admin.auth().setCustomUserClaims(uid, { role });
+
   return { uid };
 }
 
 async function handleUpdateUser(data) {
-  const { uid, email, fullName, role, departmentId } = data || {};
+  const { uid, email, fullName, role, departmentId, password } = data || {};
   if (!uid) { const err = new Error("invalid-argument"); err.status = 400; throw err; }
+
+  // Cập nhật Auth
   const authUpdate = {};
-  if (email) authUpdate.email = email;
-  if (fullName) authUpdate.displayName = fullName;
+  if (email)     authUpdate.email = email;
+  if (fullName)  authUpdate.displayName = fullName;
+  if (password)  authUpdate.password = password; // <-- thêm dòng này
   if (Object.keys(authUpdate).length) await admin.auth().updateUser(uid, authUpdate);
 
+  if (role) await admin.auth().setCustomUserClaims(uid, { role });
+
+  // Cập nhật Firestore
   const fsUpdate = {};
-  if (email !== undefined) fsUpdate.email = email;
-  if (fullName !== undefined) fsUpdate.fullName = fullName;
-  if (role !== undefined) fsUpdate.role = role;
+  if (email !== undefined)        fsUpdate.email = email;
+  if (fullName !== undefined)     fsUpdate.fullName = fullName;
+  if (role !== undefined)         fsUpdate.role = role;
   if (departmentId !== undefined) fsUpdate.departmentId = departmentId;
-  if (Object.keys(fsUpdate).length) await db.collection("users").doc(uid).set(fsUpdate, { merge: true });
+  if (Object.keys(fsUpdate).length)
+    await db.collection("users").doc(uid).set(fsUpdate, { merge: true });
+
   return { ok: true };
 }
 
 async function handleDeleteUser(data) {
   const { uid, cascade } = data || {};
   if (!uid) { const err = new Error("invalid-argument"); err.status = 400; throw err; }
+
+  // Xoá Firestore
   await db.collection("users").doc(uid).delete().catch(() => {});
   if (cascade) {
     const qs = await db.collection("schedules").where("createdBy", "==", uid).get();
     let batch = db.batch(), count = 0; const commits = [];
-    qs.forEach(doc => { batch.delete(doc.ref); count++; if (count === 400) { commits.push(batch.commit()); batch = db.batch(); count = 0; } });
+    qs.forEach(doc => {
+      batch.delete(doc.ref); count++;
+      if (count === 400) { commits.push(batch.commit()); batch = db.batch(); count = 0; }
+    });
     commits.push(batch.commit());
     await Promise.all(commits);
   }
+
+  // Xoá Auth
   await admin.auth().deleteUser(uid);
   return { ok: true };
 }
@@ -110,11 +131,13 @@ app.post("/admin", async (req, res) => {
     await assertAdminFromIdToken(req);
     const { action, data } = req.body || {};
     if (!action) return res.status(400).json({ error: "missing action" });
+
     let result;
-    if (action === "createUser") result = await handleCreateUser(data);
+    if (action === "createUser")      result = await handleCreateUser(data);
     else if (action === "updateUser") result = await handleUpdateUser(data);
     else if (action === "deleteUser") result = await handleDeleteUser(data);
     else return res.status(400).json({ error: "unknown action" });
+
     return res.json(result);
   } catch (e) {
     console.error("[/admin] ERROR:", e);
