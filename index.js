@@ -28,12 +28,20 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// --- Log mọi request để nhìn Render ping ---
-app.use((req, _res, next) => { console.log("[REQ]", req.method, req.url); next(); });
+// logging (đặt gần đầu file, sau app = express())
+app.use((req, res, next) => {
+  res.on("finish", () => {
+    if (req.path !== "/health" && req.path !== "/") {
+      console.log("[RES]", req.method, req.url, res.statusCode);
+    }
+  });
+  next();
+});
 
-// --- HEALTH CHECK: Render ping GET / (và HEAD /) ---
-app.head("/", (req, res) => res.status(200).end());
-app.get("/", (req, res) => res.status(200).send("OK"));
+// HEALTH CHECK endpoints
+app.head("/", (req, res) => res.sendStatus(200));
+app.get("/",  (req, res) => res.status(200).send("OK"));
+
 
 // --- API /admin (giữ nguyên logic bạn đang có) ---
 async function assertAdminFromIdToken(req) {
