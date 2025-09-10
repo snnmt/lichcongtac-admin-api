@@ -1,149 +1,91 @@
-// index.js
-const express = require("express");
-const cors = require("cors");
+// functions/index.js
+const functions = require("firebase-functions");
 const admin = require("firebase-admin");
 
-// --- Init firebase-admin (từ ENV trên Render) ---
-try {
-  if (!admin.apps.length) {
-    const privateKey = process.env.FIREBASE_PRIVATE_KEY
-      ? process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n")
-      : undefined;
-
-    admin.initializeApp({
-      credential: admin.credential.cert({
-        projectId: process.env.FIREBASE_PROJECT_ID,
-        clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-        privateKey,
-      }),
-    });
-  }
-} catch (e) {
-  console.error("[BOOT] admin.initializeApp FAILED:", e);
-  setTimeout(() => process.exit(1), 1500);
-}
-
+try { admin.app(); } catch (e) { admin.initializeApp(); }
 const db = admin.firestore();
-const app = express();
-app.use(cors());
-app.use(express.json());
 
-// Logging đơn giản
-app.use((req, res, next) => {
-  res.on("finish", () => {
-    if (req.path !== "/health" && req.path !== "/") {
-      console.log("[RES]", req.method, req.url, res.statusCode);
-    }
-  });
-  next();
-});
-
-// Health check
-app.head("/", (req, res) => res.sendStatus(200));
-app.get("/",  (req, res) => res.status(200).send("OK"));
-app.get("/health", (req, res) => res.json({ ok: true }));
-
-// --- Authz: xác thực admin từ ID token ---
-async function assertAdminFromIdToken(req) {
-  const h = req.headers.authorization || "";
-  const idToken = h.startsWith("Bearer ") ? h.slice(7) : null;
-  if (!idToken) { const err = new Error("unauthenticated"); err.status = 401; throw err; }
-  const decoded = await admin.auth().verifyIdToken(idToken);
-  const uid = decoded.uid;
-  const snap = await db.collection("users").doc(uid).get();
-  if (!snap.exists || snap.get("role") !== "admin") {
-    const err = new Error("permission-denied"); err.status = 403; throw err;
+/**
+ * Payload: { email, password, fullName, role, orgId, departmentId }
+ * Yêu cầu:
+ *  - Caller phải đăng nhập.
+ *  - superadmin: tạo user cho bất kỳ org.
+ *  - admin: chỉ tạo user trong org của chính mình.
+ * Kết quả: { uid }
+ */
+exports.adminCreateUser = functions.https.onCall(async (data, context) => {
+  if (!context.auth) {
+    throw new functions.https.HttpsError("unauthenticated", "Bạn cần đăng nhập.");
   }
-  return uid;
-}
 
-// --- Actions ---
-async function handleCreateUser(data) {
-  const { email, password, fullName, role, departmentId } = data || {};
-  if (!email || !password || !fullName || !role) {
-    const err = new Error("invalid-argument"); err.status = 400; throw err;
+  const email = (data.email || "").trim().toLowerCase();
+  const password = (data.password || "").trim();
+  const fullName = (data.fullName || "").trim();
+  const role = (data.role || "user").trim();
+  const orgId = (data.orgId || "").trim();
+  const departmentId = (data.departmentId || null);
+
+  if (!email || !password || !fullName || !orgId) {
+    throw new functions.https.HttpsError("invalid-argument", "Thiếu tham số bắt buộc.");
   }
-  const userRecord = await admin.auth().createUser({
-    email, password, displayName: fullName, emailVerified: false, disabled: false,
-  });
+
+  // Lấy hồ sơ caller để kiểm tra quyền + org
+  const callerUid = context.auth.uid;
+  const callerDoc = await db.collection("users").doc(callerUid).get();
+  if (!callerDoc.exists) {
+    throw new functions.https.HttpsError("permission-denied", "Không tìm thấy hồ sơ của bạn.");
+  }
+  const caller = callerDoc.data();
+  const callerRole = caller.role || "user";
+  const callerOrg = caller.orgId;
+
+  const isSuper = callerRole === "superadmin";
+  const isAdmin = isSuper || callerRole === "admin";
+  if (!isAdmin) {
+    throw new functions.https.HttpsError("permission-denied", "Bạn không có quyền tạo người dùng.");
+  }
+  if (!isSuper && callerOrg !== orgId) {
+    throw new functions.https.HttpsError("permission-denied", "Admin chỉ được tạo trong tổ chức của mình.");
+  }
+
+  // Tạo Auth user
+  let userRecord;
+  try {
+    userRecord = await admin.auth().createUser({
+      email,
+      password,
+      displayName: fullName,
+      disabled: false
+    });
+  } catch (e) {
+    // nếu user đã tồn tại, có thể trả lỗi cụ thể
+    throw new functions.https.HttpsError("already-exists", e.message);
+  }
+
   const uid = userRecord.uid;
 
-  await db.collection("users").doc(uid).set({
-    uid, email, fullName, role, departmentId: departmentId || null,
-    createdAt: admin.firestore.FieldValue.serverTimestamp(),
-  }, { merge: true });
+  // (Tuỳ chọn) set custom claims cho nhanh trong client (không bắt buộc vì rules đọc từ users/{uid})
+  try {
+    await admin.auth().setCustomUserClaims(uid, {
+      orgId: orgId,
+      role: role
+    });
+  } catch (e) {
+    console.warn("setCustomUserClaims fail", e);
+  }
 
-  // set custom claims (nếu muốn)
-  await admin.auth().setCustomUserClaims(uid, { role });
+  // Tạo hồ sơ Firestore
+  const userDoc = {
+    uid,
+    email,
+    fullName,
+    role: role || "user",
+    orgId,
+    departmentId: departmentId || null,
+    createdAt: admin.firestore.FieldValue.serverTimestamp()
+  };
+
+  await db.collection("users").doc(uid).set(userDoc, { merge: true });
 
   return { uid };
-}
-
-async function handleUpdateUser(data) {
-  const { uid, email, fullName, role, departmentId, password } = data || {};
-  if (!uid) { const err = new Error("invalid-argument"); err.status = 400; throw err; }
-
-  // Cập nhật Auth
-  const authUpdate = {};
-  if (email)     authUpdate.email = email;
-  if (fullName)  authUpdate.displayName = fullName;
-  if (password)  authUpdate.password = password; // <-- thêm dòng này
-  if (Object.keys(authUpdate).length) await admin.auth().updateUser(uid, authUpdate);
-
-  if (role) await admin.auth().setCustomUserClaims(uid, { role });
-
-  // Cập nhật Firestore
-  const fsUpdate = {};
-  if (email !== undefined)        fsUpdate.email = email;
-  if (fullName !== undefined)     fsUpdate.fullName = fullName;
-  if (role !== undefined)         fsUpdate.role = role;
-  if (departmentId !== undefined) fsUpdate.departmentId = departmentId;
-  if (Object.keys(fsUpdate).length)
-    await db.collection("users").doc(uid).set(fsUpdate, { merge: true });
-
-  return { ok: true };
-}
-
-async function handleDeleteUser(data) {
-  const { uid, cascade } = data || {};
-  if (!uid) { const err = new Error("invalid-argument"); err.status = 400; throw err; }
-
-  // Xoá Firestore
-  await db.collection("users").doc(uid).delete().catch(() => {});
-  if (cascade) {
-    const qs = await db.collection("schedules").where("createdBy", "==", uid).get();
-    let batch = db.batch(), count = 0; const commits = [];
-    qs.forEach(doc => {
-      batch.delete(doc.ref); count++;
-      if (count === 400) { commits.push(batch.commit()); batch = db.batch(); count = 0; }
-    });
-    commits.push(batch.commit());
-    await Promise.all(commits);
-  }
-
-  // Xoá Auth
-  await admin.auth().deleteUser(uid);
-  return { ok: true };
-}
-
-app.post("/admin", async (req, res) => {
-  try {
-    await assertAdminFromIdToken(req);
-    const { action, data } = req.body || {};
-    if (!action) return res.status(400).json({ error: "missing action" });
-
-    let result;
-    if (action === "createUser")      result = await handleCreateUser(data);
-    else if (action === "updateUser") result = await handleUpdateUser(data);
-    else if (action === "deleteUser") result = await handleDeleteUser(data);
-    else return res.status(400).json({ error: "unknown action" });
-
-    return res.json(result);
-  } catch (e) {
-    console.error("[/admin] ERROR:", e);
-    return res.status(e.status || 500).json({ error: e.message || "internal" });
-  }
 });
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("Admin API listening on", PORT));
