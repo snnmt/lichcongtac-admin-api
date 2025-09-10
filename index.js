@@ -1,249 +1,336 @@
-// index.js (Express API – Multi-tenant, admin/superadmin, có orgId & department kiểm tra chéo)
+// index.js
+"use strict";
 
 const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
 
-// --- Init firebase-admin (từ ENV trên Render) ---
-try {
-  if (!admin.apps.length) {
-    const privateKey = process.env.FIREBASE_PRIVATE_KEY
-      ? process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n")
-      : undefined;
+/* ----------------------------- INIT ADMIN SDK ----------------------------- */
+/* Ưu tiên init bằng 3 ENV biến: FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY
+   Nếu không đủ, fallback sang ADC (GOOGLE_APPLICATION_CREDENTIALS). */
+(function initAdmin() {
+  if (admin.apps.length) return;
+  try {
+    const { FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY } = process.env;
 
-    admin.initializeApp({
-      credential: admin.credential.cert({
-        projectId: process.env.FIREBASE_PROJECT_ID,
-        clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-        privateKey,
-      }),
-    });
+    if (FIREBASE_PROJECT_ID && FIREBASE_CLIENT_EMAIL && FIREBASE_PRIVATE_KEY) {
+      const privateKey = FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n");
+      admin.initializeApp({
+        credential: admin.credential.cert({
+          projectId: FIREBASE_PROJECT_ID,
+          clientEmail: FIREBASE_CLIENT_EMAIL,
+          privateKey,
+        }),
+      });
+      console.log("[BOOT] admin initialized via CERT env.");
+    } else {
+      admin.initializeApp(); // GOOGLE_APPLICATION_CREDENTIALS / metadata
+      console.log("[BOOT] admin initialized via ADC.");
+    }
+  } catch (e) {
+    console.error("[BOOT] admin.initializeApp FAILED:", e);
+    setTimeout(() => process.exit(1), 1500);
   }
-} catch (e) {
-  console.error("[BOOT] admin.initializeApp FAILED:", e);
-  setTimeout(() => process.exit(1), 1500);
-}
+})();
 
 const db = admin.firestore();
+
+/* ------------------------------ EXPRESS APP ------------------------------ */
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
 
-// Logging đơn giản
+// Logging nhẹ
 app.use((req, res, next) => {
+  const t0 = Date.now();
   res.on("finish", () => {
-    if (req.path !== "/health" && req.path !== "/") {
-      console.log("[RES]", req.method, req.url, res.statusCode);
+    if (req.path !== "/" && req.path !== "/health") {
+      console.log(
+        `[RES] ${req.method} ${req.originalUrl} ${res.statusCode} - ${Date.now() - t0}ms`
+      );
     }
   });
   next();
 });
 
 // Health check
-app.head("/", (_req, res) => res.sendStatus(200));
-app.get("/",  (_req, res) => res.status(200).send("OK"));
-app.get("/health", (_req, res) => res.json({ ok: true }));
+app.head("/", (req, res) => res.sendStatus(200));
+app.get("/", (req, res) => res.status(200).send("OK"));
+app.get("/health", (req, res) => res.json({ ok: true }));
 
-// ---------- Helpers & AuthZ ----------
-
-async function getCallerProfile(uid) {
-  const snap = await db.collection("users").doc(uid).get();
-  return snap.exists ? snap.data() : null;
-}
-
-async function assertAdminFromIdToken(req) {
+/* ------------------------------ AUTH HELPERS ----------------------------- */
+async function verifyBearerIdToken(req) {
   const h = req.headers.authorization || "";
   const idToken = h.startsWith("Bearer ") ? h.slice(7) : null;
   if (!idToken) {
-    const err = new Error("unauthenticated"); err.status = 401; throw err;
+    const err = new Error("unauthenticated");
+    err.status = 401;
+    throw err;
   }
   const decoded = await admin.auth().verifyIdToken(idToken);
-  const uid = decoded.uid;
+  return decoded.uid;
+}
 
-  // Ưu tiên đọc role/orgId từ Firestore; fallback từ custom claims
-  const profile = await getCallerProfile(uid);
-  const role = profile?.role || decoded.role || decoded.claims?.role;
-  const orgId = profile?.orgId || decoded.orgId || decoded.claims?.orgId;
-
-  const isSuperadmin = role === "superadmin";
-  const isAdmin = isSuperadmin || role === "admin";
-
-  if (!isAdmin) {
-    const err = new Error("permission-denied"); err.status = 403; throw err;
+/** Lấy userInfo trong FS, trả { uid, role, orgId }.
+ *  Yêu cầu: user doc phải có role, orgId (theo mẫu app).
+ */
+async function getActor(uid) {
+  const snap = await db.collection("users").doc(uid).get();
+  if (!snap.exists) {
+    const err = new Error("actor-not-found");
+    err.status = 403;
+    throw err;
   }
-  return { uid, role, orgId, isAdmin, isSuperadmin };
+  const role = snap.get("role");
+  const orgId = snap.get("orgId");
+  if (!role) {
+    const err = new Error("no-role");
+    err.status = 403;
+    throw err;
+  }
+  return { uid, role, orgId };
+}
+
+/** Chỉ cho phép:
+ *  - superadmin: mọi thao tác
+ *  - admin: chỉ thao tác trong orgId của chính mình
+ */
+function assertOrgScope(actor, targetOrgId) {
+  if (actor.role === "superadmin") return;
+  if (!actor.orgId || actor.orgId !== targetOrgId) {
+    const err = new Error("permission-denied");
+    err.status = 403;
+    throw err;
+  }
+}
+
+/* ------------------------------ VALIDATORS ------------------------------- */
+function requireString(v, name) {
+  if (!v || typeof v !== "string") {
+    const err = new Error(`invalid-${name}`);
+    err.status = 400;
+    throw err;
+  }
+  return v.trim();
 }
 
 async function assertDepartmentBelongsToOrg(departmentId, orgId) {
-  if (!departmentId) return true; // cho phép null
-  const qs = await db.collection("departments")
-    .where("orgId", "==", orgId)
-    .where("id", "==", departmentId)   // field id nội bộ = mã phòng ban
-    .limit(1)
-    .get();
-  return !qs.empty;
+  if (!departmentId) return; // optional
+  const depDoc = await db.collection("departments").doc(departmentId).get();
+  if (!depDoc.exists) {
+    const err = new Error("department-not-found");
+    err.status = 400;
+    throw err;
+  }
+  const depOrg = depDoc.get("orgId") || depDoc.get("organizationId");
+  if (depOrg && depOrg !== orgId) {
+    const err = new Error("department-org-mismatch");
+    err.status = 400;
+    throw err;
+  }
 }
 
-// ---------- Actions ----------
+/* ------------------------------- ACTIONS --------------------------------- */
+/** Tạo user Auth + users/{uid} trong đúng org, có thể gán departmentId.
+ *  body.data: { email, password, fullName, role, orgId, departmentId? }
+ */
+async function handleCreateUser(actor, data) {
+  const email = requireString(data?.email, "email");
+  const password = requireString(data?.password, "password");
+  const fullName = requireString(data?.fullName, "fullName");
+  const role = requireString(data?.role, "role"); // "member" | "admin" | "superadmin"
+  const orgId = requireString(data?.orgId, "orgId");
+  const departmentId = data?.departmentId ? String(data.departmentId).trim() : null;
 
-async function handleCreateUser(data, caller) {
-  const { email, password, fullName, role, orgId, departmentId } = data || {};
+  // admin (thường) chỉ được tạo user trong org của mình
+  assertOrgScope(actor, orgId);
 
-  if (!email || !password || !fullName || !role || !orgId) {
-    const err = new Error("invalid-argument: email, password, fullName, role, orgId là bắt buộc");
-    err.status = 400; throw err;
-  }
-  if (!caller.isSuperadmin && caller.orgId !== orgId) {
-    const err = new Error("permission-denied: admin chỉ được tạo user trong org của mình");
-    err.status = 403; throw err;
-  }
-  const okDept = await assertDepartmentBelongsToOrg(departmentId, orgId);
-  if (!okDept) {
-    const err = new Error("invalid-argument: departmentId không thuộc orgId");
-    err.status = 400; throw err;
+  // Không cho admin tạo superadmin
+  if (role === "superadmin" && actor.role !== "superadmin") {
+    const err = new Error("cannot-create-superadmin");
+    err.status = 403;
+    throw err;
   }
 
-  // Tạo Auth user
-  let userRecord;
-  try {
-    userRecord = await admin.auth().createUser({
-      email: String(email).trim().toLowerCase(),
-      password: String(password),
-      displayName: String(fullName),
-      emailVerified: false,
-      disabled: false,
-    });
-  } catch (e) {
-    const err = new Error(e.message || "createUser failed");
-    err.status = 409; throw err; // already exists/conflict
-  }
+  await assertDepartmentBelongsToOrg(departmentId, orgId);
+
+  // Tạo Auth
+  const userRecord = await admin.auth().createUser({
+    email,
+    password,
+    displayName: fullName,
+    emailVerified: false,
+    disabled: false,
+  });
   const uid = userRecord.uid;
 
-  // Custom claims (hữu ích cho client)
-  try {
-    await admin.auth().setCustomUserClaims(uid, { role, orgId });
-  } catch (e) {
-    console.warn("setCustomUserClaims failed:", e.message);
-  }
+  // Ghi Firestore
+  await db
+    .collection("users")
+    .doc(uid)
+    .set(
+      {
+        uid,
+        email,
+        fullName,
+        role,
+        orgId,
+        departmentId: departmentId || null,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
 
-  // Hồ sơ Firestore
-  await db.collection("users").doc(uid).set({
-    uid,
-    email: String(email).trim().toLowerCase(),
-    fullName: String(fullName),
-    role: String(role),
-    orgId: String(orgId),
-    departmentId: departmentId || null,
-    createdAt: admin.firestore.FieldValue.serverTimestamp(),
-  }, { merge: true });
+  // Custom claims
+  await admin.auth().setCustomUserClaims(uid, { role, orgId });
 
   return { uid };
 }
 
-async function handleUpdateUser(data, caller) {
-  const { uid, email, fullName, role, departmentId, password, orgId } = data || {};
-  if (!uid) { const err = new Error("invalid-argument: uid là bắt buộc"); err.status = 400; throw err; }
+/** Cập nhật thông tin người dùng.
+ *  body.data: { uid, email?, fullName?, role?, departmentId?, password?, orgId?* }
+ *  - orgId?: chỉ superadmin mới được đổi orgId của người dùng.
+ */
+async function handleUpdateUser(actor, data) {
+  const uid = requireString(data?.uid, "uid");
 
-  // Lấy hồ sơ hiện tại để kiểm tra quyền theo org
-  const target = await getCallerProfile(uid);
-  const targetOrg = target?.orgId || null;
-
-  // Nếu truyền orgId mới -> chỉ superadmin được đổi org; admin bị chặn
-  if (orgId && !caller.isSuperadmin) {
-    const err = new Error("permission-denied: chỉ superadmin được đổi org của user");
-    err.status = 403; throw err;
+  // Lấy user hiện tại trong FS để xác định org gốc (scope check)
+  const curSnap = await db.collection("users").doc(uid).get();
+  if (!curSnap.exists) {
+    const err = new Error("user-not-found");
+    err.status = 404;
+    throw err;
   }
+  const curOrgId = curSnap.get("orgId");
 
-  // Admin chỉ có thể sửa user trong org của mình
-  if (!caller.isSuperadmin && targetOrg && targetOrg !== caller.orgId) {
-    const err = new Error("permission-denied: không thể sửa user ngoài org");
-    err.status = 403; throw err;
-  }
+  // Admin chỉ được sửa user thuộc org của mình
+  assertOrgScope(actor, curOrgId);
 
-  // Validate department theo org đích (nếu có)
-  const finalOrgForCheck = orgId || targetOrg || caller.orgId;
-  if (departmentId !== undefined) {
-    const okDept = await assertDepartmentBelongsToOrg(departmentId, finalOrgForCheck);
-    if (!okDept) {
-      const err = new Error("invalid-argument: departmentId không thuộc org hiện tại");
-      err.status = 400; throw err;
+  const email = data?.email;
+  const fullName = data?.fullName;
+  const role = data?.role;
+  const departmentId = data?.departmentId;
+  const password = data?.password;
+  const newOrgId = data?.orgId; // tuỳ chọn: chỉ superadmin
+
+  // Nếu truyền orgId mới -> chỉ superadmin
+  if (newOrgId !== undefined) {
+    if (actor.role !== "superadmin") {
+      const err = new Error("cannot-change-org-as-admin");
+      err.status = 403;
+      throw err;
     }
+    requireString(newOrgId, "orgId");
   }
 
-  // Cập nhật Auth
+  if (departmentId !== undefined) {
+    const checkDep = departmentId ? String(departmentId).trim() : null;
+    const validateOrg = newOrgId !== undefined ? newOrgId : curOrgId;
+    await assertDepartmentBelongsToOrg(checkDep, validateOrg);
+  }
+
+  // Cập nhật Auth nếu cần
   const authUpdate = {};
-  if (email)    authUpdate.email = String(email).trim().toLowerCase();
-  if (fullName) authUpdate.displayName = String(fullName);
+  if (email) authUpdate.email = String(email).trim();
+  if (fullName) authUpdate.displayName = String(fullName).trim();
   if (password) authUpdate.password = String(password);
   if (Object.keys(authUpdate).length) await admin.auth().updateUser(uid, authUpdate);
 
-  // Cập nhật claims nếu đổi role/org
-  const claims = {};
-  if (role) claims.role = String(role);
-  if (orgId) claims.orgId = String(orgId);
-  if (Object.keys(claims).length) {
-    try { await admin.auth().setCustomUserClaims(uid, claims); }
-    catch (e) { console.warn("setCustomUserClaims(update) failed:", e.message); }
-  }
+  // Cập nhật custom claims nếu thay role hoặc org
+  const claimsUpdate = {};
+  if (role !== undefined) claimsUpdate.role = role;
+  if (newOrgId !== undefined) claimsUpdate.orgId = newOrgId;
+  if (Object.keys(claimsUpdate).length)
+    await admin.auth().setCustomUserClaims(uid, {
+      role: claimsUpdate.role ?? curSnap.get("role"),
+      orgId: claimsUpdate.orgId ?? curOrgId,
+    });
 
   // Cập nhật Firestore
   const fsUpdate = {};
-  if (email !== undefined)        fsUpdate.email = String(email).trim().toLowerCase();
-  if (fullName !== undefined)     fsUpdate.fullName = String(fullName);
-  if (role !== undefined)         fsUpdate.role = String(role);
+  if (email !== undefined) fsUpdate.email = email;
+  if (fullName !== undefined) fsUpdate.fullName = fullName;
+  if (role !== undefined) fsUpdate.role = role;
   if (departmentId !== undefined) fsUpdate.departmentId = departmentId || null;
-  if (orgId !== undefined)        fsUpdate.orgId = String(orgId);
+  if (newOrgId !== undefined) fsUpdate.orgId = newOrgId;
 
-  if (Object.keys(fsUpdate).length)
+  if (Object.keys(fsUpdate).length) {
     await db.collection("users").doc(uid).set(fsUpdate, { merge: true });
+  }
 
   return { ok: true };
 }
 
-async function handleDeleteUser(data, caller) {
-  const { uid, cascade } = data || {};
-  if (!uid) { const err = new Error("invalid-argument: uid là bắt buộc"); err.status = 400; throw err; }
+/** Xoá người dùng.
+ *  body.data: { uid, cascade? }
+ *  - Chỉ xoá được trong org của mình (trừ superadmin).
+ *  - cascade: xoá schedules do user tạo (lọc theo createdBy == uid).
+ */
+async function handleDeleteUser(actor, data) {
+  const uid = requireString(data?.uid, "uid");
+  const cascade = !!data?.cascade;
 
-  const target = await getCallerProfile(uid);
-  const targetOrg = target?.orgId || null;
-  if (!caller.isSuperadmin && targetOrg && targetOrg !== caller.orgId) {
-    const err = new Error("permission-denied: không thể xóa user ngoài org");
-    err.status = 403; throw err;
+  // Scope check
+  const snap = await db.collection("users").doc(uid).get();
+  if (!snap.exists) {
+    const err = new Error("user-not-found");
+    err.status = 404;
+    throw err;
   }
+  const targetOrgId = snap.get("orgId");
+  assertOrgScope(actor, targetOrgId);
 
-  // Xoá hồ sơ Firestore
+  // Xoá Firestore user doc
   await db.collection("users").doc(uid).delete().catch(() => {});
+
+  // Xoá lịch (nếu yêu cầu)
   if (cascade) {
     const qs = await db.collection("schedules").where("createdBy", "==", uid).get();
-    let batch = db.batch(), count = 0; const commits = [];
-    qs.forEach(doc => {
-      batch.delete(doc.ref); count++;
-      if (count === 400) { commits.push(batch.commit()); batch = db.batch(); count = 0; }
+    let batch = db.batch();
+    let count = 0;
+    const commits = [];
+    qs.forEach((doc) => {
+      batch.delete(doc.ref);
+      count++;
+      if (count === 400) {
+        commits.push(batch.commit());
+        batch = db.batch();
+        count = 0;
+      }
     });
-    commits.push(batch.commit());
+    if (count > 0) commits.push(batch.commit());
     await Promise.all(commits);
   }
 
   // Xoá Auth
-  try { await admin.auth().deleteUser(uid); } catch (e) {
-    // nếu không tồn tại, bỏ qua
-  }
+  await admin.auth().deleteUser(uid);
+
   return { ok: true };
 }
 
-// ---------- Router ----------
-
+/* ------------------------------- MAIN ROUTE ------------------------------ */
+/** POST /admin
+ *  headers: Authorization: Bearer <ID_TOKEN>
+ *  body: { action: "createUser"|"updateUser"|"deleteUser", data: {...} }
+ */
 app.post("/admin", async (req, res) => {
   try {
-    const caller = await assertAdminFromIdToken(req);
+    const actorUid = await verifyBearerIdToken(req);
+    const actor = await getActor(actorUid); // { uid, role, orgId }
+
     const { action, data } = req.body || {};
     if (!action) return res.status(400).json({ error: "missing action" });
 
     let result;
-    if (action === "createUser")      result = await handleCreateUser(data, caller);
-    else if (action === "updateUser") result = await handleUpdateUser(data, caller);
-    else if (action === "deleteUser") result = await handleDeleteUser(data, caller);
-    else return res.status(400).json({ error: "unknown action" });
+    if (action === "createUser") {
+      result = await handleCreateUser(actor, data);
+    } else if (action === "updateUser") {
+      result = await handleUpdateUser(actor, data);
+    } else if (action === "deleteUser") {
+      result = await handleDeleteUser(actor, data);
+    } else {
+      return res.status(400).json({ error: "unknown action" });
+    }
 
     return res.json(result);
   } catch (e) {
@@ -252,6 +339,44 @@ app.post("/admin", async (req, res) => {
   }
 });
 
-// ---------- Start ----------
+/* --------------------------- OPTIONAL: LIST USERS ------------------------ */
+/** GET /users?orgId=...&departmentId=...
+ *  - Chỉ để test/đối soát; app có thể không dùng endpoint này.
+ *  - admin chỉ xem được org của mình, superadmin xem được mọi org.
+ */
+app.get("/users", async (req, res) => {
+  try {
+    const actorUid = await verifyBearerIdToken(req);
+    const actor = await getActor(actorUid);
+
+    const orgId = requireString(req.query.orgId, "orgId");
+    const departmentId = req.query.departmentId ? String(req.query.departmentId).trim() : null;
+
+    assertOrgScope(actor, orgId);
+
+    let q = db.collection("users").where("orgId", "==", orgId);
+    if (departmentId) q = q.where("departmentId", "==", departmentId);
+    const qs = await q.orderBy("fullName").get();
+
+    const users = qs.docs.map((d) => {
+      const x = d.data();
+      return {
+        uid: d.id,
+        email: x.email || "",
+        fullName: x.fullName || "",
+        role: x.role || "member",
+        orgId: x.orgId || null,
+        departmentId: x.departmentId || null,
+      };
+    });
+
+    res.json({ users });
+  } catch (e) {
+    console.error("[/users] ERROR:", e);
+    res.status(e.status || 500).json({ error: e.message || "internal" });
+  }
+});
+
+/* ------------------------------- START APP ------------------------------- */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("Admin API listening on", PORT));
