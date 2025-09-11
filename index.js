@@ -38,7 +38,7 @@ app.use(express.json({ limit: "1mb" }));
 // ====== LOG ======
 app.use((req, res, next) => {
   res.on("finish", () => {
-    if (req.path !== "/health" && req.path !== "/") {
+    if (!["/health", "/"].includes(req.path)) {
       console.log("[RES]", req.method, req.url, res.statusCode);
     }
   });
@@ -49,40 +49,16 @@ app.use((req, res, next) => {
 app.head("/", (req, res) => res.sendStatus(200));
 app.get("/", (req, res) => res.status(200).send("OK"));
 app.get("/health", (req, res) => res.json({ ok: true }));
-//=====kiemtra====
-// Gợi ý khi ai đó truy cập /admin bằng GET
+
+// ====== HINT FOR GET /admin ======
 app.get("/admin", (req, res) => {
   res.status(405).json({
     error: "method-not-allowed",
-    message: "Hãy gọi POST /admin với header Authorization: Bearer <idToken> và body JSON."
+    message:
+      "Hãy gọi POST /admin với header Authorization: Bearer <idToken> và body JSON.",
   });
 });
 
-// Debug xem ai đang gọi API (dùng để kiểm tra role/orgId)
-app.get("/debug/whoami", async (req, res) => {
-  try {
-    const h = req.headers.authorization || "";
-    const idToken = h.startsWith("Bearer ") ? h.slice(7) : null;
-    if (!idToken) return res.status(401).json({ error: "unauthenticated" });
-
-    const decoded = await admin.auth().verifyIdToken(idToken);
-    const snap = await db.collection("users").doc(decoded.uid).get();
-    const userDoc = snap.exists ? snap.data() : null;
-
-    return res.json({
-      ok: true,
-      me: {
-        uid: decoded.uid,
-        email: decoded.email || (userDoc && userDoc.email) || null,
-        role: (userDoc && userDoc.role) || decoded.role || null,
-        orgId: (userDoc && userDoc.orgId) || decoded.orgId || null
-      }
-    });
-  } catch (e) {
-    console.error("[/debug/whoami] ERROR:", e);
-    return res.status(500).json({ error: "internal" });
-  }
-});
 // ====== AUTHZ HELPER ======
 function parseSuperAdmins() {
   const raw = process.env.SUPER_ADMINS || "";
@@ -105,41 +81,49 @@ async function assertAdminFromIdToken(req) {
   const uid = decoded.uid;
   const email = (decoded.email || "").toLowerCase();
 
-  // 1) Firestore role
+  // 1) Firestore role/orgId
   let roleFS = null;
+  let orgIdFS = null;
   try {
     const snap = await db.collection("users").doc(uid).get();
-    roleFS = snap.exists ? snap.get("role") : null;
+    if (snap.exists) {
+      roleFS = snap.get("role") || null;
+      orgIdFS = snap.get("orgId") || null;
+    }
   } catch (e) {
     console.warn("[AUTHZ] Read users/{uid} failed:", e?.message || e);
   }
 
-  // 2) Custom claim role
-  const roleClaim = decoded.role;
+  // 2) Custom claim role/org
+  const roleClaim = decoded.role || null;
+  const orgClaim = decoded.orgId || null;
 
-  // 3) Bootstrap bằng ENV SUPER_ADMINS (email)
+  // 3) Bootstrap bằng ENV SUPER_ADMINS (theo email)
   const supers = parseSuperAdmins();
   const isBootstrapSuper = email && supers.includes(email);
 
   const role = roleFS || roleClaim || (isBootstrapSuper ? "superadmin" : null);
+  const orgId = orgIdFS || orgClaim || null;
 
   if (!["admin", "superadmin"].includes(role)) {
-    console.error("[AUTHZ] Denied, uid/email:", uid, email, "roleFS:", roleFS, "claim:", roleClaim);
+    console.error(
+      "[AUTHZ] Denied, uid/email:",
+      uid,
+      email,
+      "roleFS:",
+      roleFS,
+      "claim:",
+      roleClaim
+    );
     const err = new Error("permission-denied");
     err.status = 403;
     throw err;
   }
 
-  // trả thêm orgId để log
-  let orgIdFS = null;
-  try {
-    const snap = await db.collection("users").doc(uid).get();
-    orgIdFS = snap.exists ? snap.get("orgId") : null;
-  } catch {}
-  return { uid, email, role, orgId: orgIdFS };
+  return { uid, email, role, orgId };
 }
 
-// ====== DEBUG ======
+// ====== DEBUG WHOAMI ======
 app.get("/debug/whoami", async (req, res) => {
   try {
     const me = await assertAdminFromIdToken(req);
@@ -148,6 +132,31 @@ app.get("/debug/whoami", async (req, res) => {
     return res.status(e.status || 500).json({ error: e.message || "internal" });
   }
 });
+
+// ====== VALIDATION HELPERS ======
+async function assertDepartmentBelongsToOrg(departmentId, orgId) {
+  if (!departmentId) return null; // optional
+  const ref = db.collection("departments").doc(departmentId);
+  const snap = await ref.get();
+  if (!snap.exists) {
+    const err = new Error("department-not-found");
+    err.status = 400;
+    throw err;
+  }
+  const data = snap.data() || {};
+  if (data.orgId !== orgId) {
+    const err = new Error("department-org-mismatch");
+    err.status = 400;
+    err.details = `Department ${departmentId} không thuộc org ${orgId}`;
+    throw err;
+  }
+  return data;
+}
+
+async function getUserDoc(uid) {
+  const s = await db.collection("users").doc(uid).get();
+  return s.exists ? s.data() : null;
+}
 
 // ====== ACTIONS ======
 async function handleCreateUser(data, caller) {
@@ -159,13 +168,27 @@ async function handleCreateUser(data, caller) {
     throw err;
   }
 
-  // Nếu caller chỉ là admin, không cho tạo superadmin
-  if (caller.role === "admin" && role === "superadmin") {
-    const err = new Error("permission-denied");
-    err.status = 403;
-    err.details = "admin không được tạo superadmin";
-    throw err;
+  // Admin chỉ được tạo trong org của mình & không tạo superadmin
+  if (caller.role === "admin") {
+    if (role === "superadmin") {
+      const err = new Error("permission-denied");
+      err.status = 403;
+      err.details = "admin không được tạo superadmin";
+      throw err;
+    }
+    if (caller.orgId && orgId !== caller.orgId) {
+      const err = new Error("permission-denied");
+      err.status = 403;
+      err.details = "admin chỉ được tạo user trong org của mình";
+      throw err;
+    }
   }
+
+  // Validate department thuộc org
+  await assertDepartmentBelongsToOrg(departmentId, orgId).catch((e) => {
+    // Không chặn superadmin nếu muốn bỏ qua kiểm tra phòng ban trống
+    if (departmentId) throw e;
+  });
 
   try {
     const userRecord = await admin.auth().createUser({
@@ -178,33 +201,41 @@ async function handleCreateUser(data, caller) {
     const uid = userRecord.uid;
     const now = admin.firestore.FieldValue.serverTimestamp();
 
-    await db.collection("users").doc(uid).set(
-      {
-        uid,
-        email,
-        fullName,
-        role,
-        orgId,
-        departmentId: departmentId || null,
-        createdAt: now,
-        updatedAt: now,
-      },
-      { merge: true }
-    );
+    await db
+      .collection("users")
+      .doc(uid)
+      .set(
+        {
+          uid,
+          email,
+          fullName,
+          role,
+          orgId,
+          departmentId: departmentId || null,
+          createdAt: now,
+          updatedAt: now,
+        },
+        { merge: true }
+      );
 
     await admin.auth().setCustomUserClaims(uid, { role, orgId });
 
-    console.log("[CREATE_USER] ok", { by: caller.email, newUid: uid, role, orgId, departmentId });
+    console.log("[CREATE_USER] ok", {
+      by: caller.email,
+      newUid: uid,
+      role,
+      orgId,
+      departmentId,
+    });
     return { uid };
   } catch (e) {
-    // Chuẩn hoá lỗi thường gặp
     const code = e?.errorInfo?.code || e?.code || "";
-    if (code.includes("auth/email-already-exists")) {
+    if (code === "auth/email-already-exists") {
       const err = new Error("email-already-exists");
       err.status = 409;
       throw err;
     }
-    if (code.includes("auth/invalid-password")) {
+    if (code === "auth/invalid-password") {
       const err = new Error("invalid-password");
       err.status = 400;
       err.details = "Mật khẩu không đạt yêu cầu";
@@ -226,13 +257,40 @@ async function handleUpdateUser(data, caller) {
     throw err;
   }
 
-  // admin không được nâng ai lên superadmin
-  if (caller.role === "admin" && role === "superadmin") {
-    const err = new Error("permission-denied");
-    err.status = 403;
-    err.details = "admin không được gán role superadmin";
+  const target = await getUserDoc(uid);
+  if (!target) {
+    const err = new Error("user-not-found");
+    err.status = 404;
     throw err;
   }
+
+  // Admin chỉ được sửa user cùng org, không gán superadmin
+  if (caller.role === "admin") {
+    if (target.orgId && caller.orgId && target.orgId !== caller.orgId) {
+      const err = new Error("permission-denied");
+      err.status = 403;
+      err.details = "admin chỉ được sửa user trong org của mình";
+      throw err;
+    }
+    if (role === "superadmin") {
+      const err = new Error("permission-denied");
+      err.status = 403;
+      err.details = "admin không được gán role superadmin";
+      throw err;
+    }
+    if (orgId && orgId !== caller.orgId) {
+      const err = new Error("permission-denied");
+      err.status = 403;
+      err.details = "admin không được chuyển user sang org khác";
+      throw err;
+    }
+  }
+
+  // Xác định org áp dụng để validate department
+  const effectiveOrg = orgId || target.orgId || caller.orgId || null;
+  await assertDepartmentBelongsToOrg(departmentId, effectiveOrg).catch((e) => {
+    if (departmentId) throw e;
+  });
 
   // Auth
   const authUpdate = {};
@@ -242,12 +300,10 @@ async function handleUpdateUser(data, caller) {
   if (Object.keys(authUpdate).length) await admin.auth().updateUser(uid, authUpdate);
 
   // Claims
-  if (role || orgId) {
-    const claims = {};
-    if (role) claims.role = role;
-    if (orgId) claims.orgId = orgId;
-    if (Object.keys(claims).length) await admin.auth().setCustomUserClaims(uid, claims);
-  }
+  const claimChanges = {};
+  if (role) claimChanges.role = role;
+  if (orgId) claimChanges.orgId = orgId;
+  if (Object.keys(claimChanges).length) await admin.auth().setCustomUserClaims(uid, claimChanges);
 
   // Firestore
   const fsUpdate = { updatedAt: admin.firestore.FieldValue.serverTimestamp() };
@@ -258,16 +314,44 @@ async function handleUpdateUser(data, caller) {
   if (departmentId !== undefined) fsUpdate.departmentId = departmentId || null;
 
   await db.collection("users").doc(uid).set(fsUpdate, { merge: true });
-  console.log("[UPDATE_USER] ok", { by: caller.email, uid, role, orgId, departmentId });
+  console.log("[UPDATE_USER] ok", {
+    by: caller.email,
+    uid,
+    role: role ?? target.role,
+    orgId: orgId ?? target.orgId,
+    departmentId: departmentId ?? target.departmentId,
+  });
   return { ok: true };
 }
 
-async function handleDeleteUser(data) {
+async function handleDeleteUser(data, caller) {
   const { uid, cascade } = data || {};
   if (!uid) {
     const err = new Error("invalid-argument");
     err.status = 400;
     throw err;
+  }
+
+  const target = await getUserDoc(uid);
+  if (!target) {
+    const err = new Error("user-not-found");
+    err.status = 404;
+    throw err;
+  }
+
+  if (caller.role === "admin") {
+    if (caller.orgId && target.orgId && caller.orgId !== target.orgId) {
+      const err = new Error("permission-denied");
+      err.status = 403;
+      err.details = "admin chỉ được xoá user trong org của mình";
+      throw err;
+    }
+    if (target.role === "superadmin") {
+      const err = new Error("permission-denied");
+      err.status = 403;
+      err.details = "admin không được xoá superadmin";
+      throw err;
+    }
   }
 
   await db.collection("users").doc(uid).delete().catch(() => {});
@@ -290,7 +374,7 @@ async function handleDeleteUser(data) {
   }
 
   await admin.auth().deleteUser(uid);
-  console.log("[DELETE_USER] ok", { uid });
+  console.log("[DELETE_USER] ok", { by: caller.email, uid });
   return { ok: true };
 }
 
@@ -306,7 +390,7 @@ app.post("/admin", async (req, res) => {
     let result;
     if (action === "createUser") result = await handleCreateUser(data, caller);
     else if (action === "updateUser") result = await handleUpdateUser(data, caller);
-    else if (action === "deleteUser") result = await handleDeleteUser(data);
+    else if (action === "deleteUser") result = await handleDeleteUser(data, caller);
     else return res.status(400).json({ error: "unknown action" });
 
     return res.json(result);
