@@ -3,17 +3,23 @@ const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
 
-// --- Init firebase-admin (ENV trên Render) ---
+// ====== BOOT ======
+function required(name) {
+  const v = process.env[name];
+  if (!v) {
+    console.error(`[BOOT] Missing ENV ${name}`);
+    setTimeout(() => process.exit(1), 1500);
+  }
+  return v;
+}
+
 try {
   if (!admin.apps.length) {
-    const privateKey = process.env.FIREBASE_PRIVATE_KEY
-      ? process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n")
-      : undefined;
-
+    const privateKey = required("FIREBASE_PRIVATE_KEY").replace(/\\n/g, "\n");
     admin.initializeApp({
       credential: admin.credential.cert({
-        projectId: process.env.FIREBASE_PROJECT_ID,
-        clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+        projectId: required("FIREBASE_PROJECT_ID"),
+        clientEmail: required("FIREBASE_CLIENT_EMAIL"),
         privateKey,
       }),
     });
@@ -29,7 +35,7 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
-// Logging đơn giản
+// ====== LOG ======
 app.use((req, res, next) => {
   res.on("finish", () => {
     if (req.path !== "/health" && req.path !== "/") {
@@ -39,12 +45,20 @@ app.use((req, res, next) => {
   next();
 });
 
-// Health check
+// ====== HEALTH ======
 app.head("/", (req, res) => res.sendStatus(200));
 app.get("/", (req, res) => res.status(200).send("OK"));
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-// --- Helper: chỉ cho admin/superadmin ---
+// ====== AUTHZ HELPER ======
+function parseSuperAdmins() {
+  const raw = process.env.SUPER_ADMINS || "";
+  return raw
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+}
+
 async function assertAdminFromIdToken(req) {
   const h = req.headers.authorization || "";
   const idToken = h.startsWith("Bearer ") ? h.slice(7) : null;
@@ -56,25 +70,54 @@ async function assertAdminFromIdToken(req) {
 
   const decoded = await admin.auth().verifyIdToken(idToken);
   const uid = decoded.uid;
+  const email = (decoded.email || "").toLowerCase();
 
-  // Ưu tiên đọc role từ Firestore users/{uid}
-  const snap = await db.collection("users").doc(uid).get();
-  const roleFS = snap.exists ? snap.get("role") : null;
+  // 1) Firestore role
+  let roleFS = null;
+  try {
+    const snap = await db.collection("users").doc(uid).get();
+    roleFS = snap.exists ? snap.get("role") : null;
+  } catch (e) {
+    console.warn("[AUTHZ] Read users/{uid} failed:", e?.message || e);
+  }
 
-  // Fallback: role từ custom claims (nếu có)
+  // 2) Custom claim role
   const roleClaim = decoded.role;
-  const role = roleFS || roleClaim;
+
+  // 3) Bootstrap bằng ENV SUPER_ADMINS (email)
+  const supers = parseSuperAdmins();
+  const isBootstrapSuper = email && supers.includes(email);
+
+  const role = roleFS || roleClaim || (isBootstrapSuper ? "superadmin" : null);
 
   if (!["admin", "superadmin"].includes(role)) {
+    console.error("[AUTHZ] Denied, uid/email:", uid, email, "roleFS:", roleFS, "claim:", roleClaim);
     const err = new Error("permission-denied");
     err.status = 403;
     throw err;
   }
-  return { uid, role };
+
+  // trả thêm orgId để log
+  let orgIdFS = null;
+  try {
+    const snap = await db.collection("users").doc(uid).get();
+    orgIdFS = snap.exists ? snap.get("orgId") : null;
+  } catch {}
+  return { uid, email, role, orgId: orgIdFS };
 }
 
-// --- Actions ---
-async function handleCreateUser(data) {
+// ====== DEBUG ======
+app.get("/debug/whoami", async (req, res) => {
+  try {
+    const me = await assertAdminFromIdToken(req);
+    return res.json({ ok: true, me });
+  } catch (e) {
+    return res.status(e.status || 500).json({ error: e.message || "internal" });
+  }
+});
+
+// ====== ACTIONS ======
+async function handleCreateUser(data, caller) {
   const { email, password, fullName, role, orgId, departmentId } = data || {};
   if (!email || !password || !fullName || !role || !orgId) {
     const err = new Error("invalid-argument");
@@ -83,21 +126,26 @@ async function handleCreateUser(data) {
     throw err;
   }
 
-  const userRecord = await admin.auth().createUser({
-    email,
-    password,
-    displayName: fullName,
-    emailVerified: false,
-    disabled: false,
-  });
-  const uid = userRecord.uid;
+  // Nếu caller chỉ là admin, không cho tạo superadmin
+  if (caller.role === "admin" && role === "superadmin") {
+    const err = new Error("permission-denied");
+    err.status = 403;
+    err.details = "admin không được tạo superadmin";
+    throw err;
+  }
 
-  const now = admin.firestore.FieldValue.serverTimestamp();
+  try {
+    const userRecord = await admin.auth().createUser({
+      email,
+      password,
+      displayName: fullName,
+      emailVerified: false,
+      disabled: false,
+    });
+    const uid = userRecord.uid;
+    const now = admin.firestore.FieldValue.serverTimestamp();
 
-  await db
-    .collection("users")
-    .doc(uid)
-    .set(
+    await db.collection("users").doc(uid).set(
       {
         uid,
         email,
@@ -111,13 +159,33 @@ async function handleCreateUser(data) {
       { merge: true }
     );
 
-  // set custom claims để client có thể đọc nhanh
-  await admin.auth().setCustomUserClaims(uid, { role, orgId });
+    await admin.auth().setCustomUserClaims(uid, { role, orgId });
 
-  return { uid };
+    console.log("[CREATE_USER] ok", { by: caller.email, newUid: uid, role, orgId, departmentId });
+    return { uid };
+  } catch (e) {
+    // Chuẩn hoá lỗi thường gặp
+    const code = e?.errorInfo?.code || e?.code || "";
+    if (code.includes("auth/email-already-exists")) {
+      const err = new Error("email-already-exists");
+      err.status = 409;
+      throw err;
+    }
+    if (code.includes("auth/invalid-password")) {
+      const err = new Error("invalid-password");
+      err.status = 400;
+      err.details = "Mật khẩu không đạt yêu cầu";
+      throw err;
+    }
+    console.error("[CREATE_USER] failed:", e);
+    const err = new Error("internal");
+    err.status = 500;
+    err.details = e?.message;
+    throw err;
+  }
 }
 
-async function handleUpdateUser(data) {
+async function handleUpdateUser(data, caller) {
   const { uid, email, fullName, role, orgId, departmentId, password } = data || {};
   if (!uid) {
     const err = new Error("invalid-argument");
@@ -125,13 +193,22 @@ async function handleUpdateUser(data) {
     throw err;
   }
 
-  // Cập nhật Auth
+  // admin không được nâng ai lên superadmin
+  if (caller.role === "admin" && role === "superadmin") {
+    const err = new Error("permission-denied");
+    err.status = 403;
+    err.details = "admin không được gán role superadmin";
+    throw err;
+  }
+
+  // Auth
   const authUpdate = {};
   if (email) authUpdate.email = email;
   if (fullName) authUpdate.displayName = fullName;
   if (password) authUpdate.password = password;
   if (Object.keys(authUpdate).length) await admin.auth().updateUser(uid, authUpdate);
 
+  // Claims
   if (role || orgId) {
     const claims = {};
     if (role) claims.role = role;
@@ -139,7 +216,7 @@ async function handleUpdateUser(data) {
     if (Object.keys(claims).length) await admin.auth().setCustomUserClaims(uid, claims);
   }
 
-  // Cập nhật Firestore
+  // Firestore
   const fsUpdate = { updatedAt: admin.firestore.FieldValue.serverTimestamp() };
   if (email !== undefined) fsUpdate.email = email;
   if (fullName !== undefined) fsUpdate.fullName = fullName;
@@ -148,7 +225,7 @@ async function handleUpdateUser(data) {
   if (departmentId !== undefined) fsUpdate.departmentId = departmentId || null;
 
   await db.collection("users").doc(uid).set(fsUpdate, { merge: true });
-
+  console.log("[UPDATE_USER] ok", { by: caller.email, uid, role, orgId, departmentId });
   return { ok: true };
 }
 
@@ -160,7 +237,6 @@ async function handleDeleteUser(data) {
     throw err;
   }
 
-  // Xoá Firestore
   await db.collection("users").doc(uid).delete().catch(() => {});
   if (cascade) {
     const qs = await db.collection("schedules").where("createdBy", "==", uid).get();
@@ -176,31 +252,34 @@ async function handleDeleteUser(data) {
         count = 0;
       }
     });
-    commits.push(batch.commit());
+    if (count > 0) commits.push(batch.commit());
     await Promise.all(commits);
   }
 
-  // Xoá Auth
   await admin.auth().deleteUser(uid);
+  console.log("[DELETE_USER] ok", { uid });
   return { ok: true };
 }
 
+// ====== ROUTE ======
 app.post("/admin", async (req, res) => {
   try {
-    await assertAdminFromIdToken(req);
+    const caller = await assertAdminFromIdToken(req);
     const { action, data } = req.body || {};
     if (!action) return res.status(400).json({ error: "missing action" });
 
+    console.log("[ADMIN]", action, "by", caller.email, "dataKeys:", Object.keys(data || {}));
+
     let result;
-    if (action === "createUser") result = await handleCreateUser(data);
-    else if (action === "updateUser") result = await handleUpdateUser(data);
+    if (action === "createUser") result = await handleCreateUser(data, caller);
+    else if (action === "updateUser") result = await handleUpdateUser(data, caller);
     else if (action === "deleteUser") result = await handleDeleteUser(data);
     else return res.status(400).json({ error: "unknown action" });
 
     return res.json(result);
   } catch (e) {
     const status = e.status || 500;
-    console.error("[/admin] ERROR:", e, e.details || "");
+    console.error("[/admin] ERROR:", e?.message || e, e?.details || "");
     return res.status(status).json({ error: e.message || "internal", details: e.details });
   }
 });
