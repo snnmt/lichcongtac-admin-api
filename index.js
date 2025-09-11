@@ -49,7 +49,40 @@ app.use((req, res, next) => {
 app.head("/", (req, res) => res.sendStatus(200));
 app.get("/", (req, res) => res.status(200).send("OK"));
 app.get("/health", (req, res) => res.json({ ok: true }));
+//=====kiemtra====
+// Gợi ý khi ai đó truy cập /admin bằng GET
+app.get("/admin", (req, res) => {
+  res.status(405).json({
+    error: "method-not-allowed",
+    message: "Hãy gọi POST /admin với header Authorization: Bearer <idToken> và body JSON."
+  });
+});
 
+// Debug xem ai đang gọi API (dùng để kiểm tra role/orgId)
+app.get("/debug/whoami", async (req, res) => {
+  try {
+    const h = req.headers.authorization || "";
+    const idToken = h.startsWith("Bearer ") ? h.slice(7) : null;
+    if (!idToken) return res.status(401).json({ error: "unauthenticated" });
+
+    const decoded = await admin.auth().verifyIdToken(idToken);
+    const snap = await db.collection("users").doc(decoded.uid).get();
+    const userDoc = snap.exists ? snap.data() : null;
+
+    return res.json({
+      ok: true,
+      me: {
+        uid: decoded.uid,
+        email: decoded.email || (userDoc && userDoc.email) || null,
+        role: (userDoc && userDoc.role) || decoded.role || null,
+        orgId: (userDoc && userDoc.orgId) || decoded.orgId || null
+      }
+    });
+  } catch (e) {
+    console.error("[/debug/whoami] ERROR:", e);
+    return res.status(500).json({ error: "internal" });
+  }
+});
 // ====== AUTHZ HELPER ======
 function parseSuperAdmins() {
   const raw = process.env.SUPER_ADMINS || "";
