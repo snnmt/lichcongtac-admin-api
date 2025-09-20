@@ -124,12 +124,39 @@ app.post("/admin", authMiddleware, requireAdmin, async (req, res) => {
     }
 
     if (action === "setPassword") {
-      const { uid, password } = data || {};
-      if (!uid || !password) return res.status(400).json({ error: "missing uid/password" });
-      await admin.auth().updateUser(uid, { password });
-      return res.json({ ok: true });
-    }
+  const { uid, password } = data || {};
+  if (!uid || !password) return res.status(400).json({ error: "missing uid/password" });
 
+  // Lấy hồ sơ người gọi
+  const myRole = (req.me.role || "").toLowerCase();
+  const myOrg  = req.me.orgId || null;
+
+  // Lấy hồ sơ target trên Firestore
+  const targetDoc = await db.collection("users").doc(uid).get();
+  if (!targetDoc.exists) {
+    return res.status(404).json({ error: "user profile not found in Firestore" });
+  }
+  const target = targetDoc.data() || {};
+
+  // Ràng buộc quyền: admin chỉ trong org của mình
+  if (myRole === "admin") {
+    if (!myOrg || target.orgId !== myOrg) {
+      return res.status(403).json({ error: "admin can only reset password within own org" });
+    }
+  }
+  // superadmin: không giới hạn
+
+  try {
+    await admin.auth().updateUser(uid, { password });
+    return res.json({ ok: true });
+  } catch (e) {
+    // UID không tồn tại trên Firebase Auth?
+    if (String(e).includes("auth/user-not-found")) {
+      return res.status(404).json({ error: "auth user not found" });
+    }
+    return res.status(500).json({ error: "updateUser failed", details: String(e) });
+  }
+}
     if (action === "deleteUser") {
       const { uid, cascade } = data || {};
       if (!uid) return res.status(400).json({ error: "missing uid" });
