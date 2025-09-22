@@ -1,3 +1,4 @@
+// index.js
 const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
@@ -7,7 +8,7 @@ const app = express();
 app.use(cors());
 app.use(bodyParser.json({ limit: "1mb" }));
 
-// ---- Firebase Admin init from env (Render -> Environment) ----
+// ---- Firebase Admin init (ENV) ----
 if (!admin.apps.length) {
   admin.initializeApp({
     credential: admin.credential.cert({
@@ -28,20 +29,21 @@ const SUPER_ADMINS = (process.env.SUPER_ADMINS || "")
 async function authMiddleware(req, res, next) {
   try {
     const hdr = req.headers.authorization || "";
-    if (!hdr.startsWith("Bearer ")) return res.status(401).json({ error: "missing bearer token" });
+    if (!hdr.startsWith("Bearer ")) {
+      return res.status(401).json({ error: "missing bearer token" });
+    }
     const idToken = hdr.slice("Bearer ".length);
     const decoded = await admin.auth().verifyIdToken(idToken);
     req.user = decoded;
-    next();
+    return next();
   } catch (e) {
-    res.status(401).json({ error: "invalid token", details: String(e) });
+    return res.status(401).json({ error: "invalid token", details: String(e) });
   }
 }
 
 async function requireAdmin(req, res, next) {
   try {
     const uid = req.user.uid;
-    // lấy từ Firestore
     const meDoc = await db.collection("users").doc(uid).get();
     const profile = meDoc.exists ? meDoc.data() : {};
     const role = (profile.role || "").toLowerCase();
@@ -60,26 +62,26 @@ async function requireAdmin(req, res, next) {
 // ---- health ----
 app.get("/health", authMiddleware, (_req, res) => res.json({ ok: true }));
 
-// ---- the /admin endpoint ----
+// ---- /admin endpoint ----
 app.post("/admin", authMiddleware, requireAdmin, async (req, res) => {
   const { action, data } = req.body || {};
-  console.log("[ADMIN]", action, "by", req.user.email);
+  console.log("[ADMIN] body =", JSON.stringify(req.body));
+  console.log("[ADMIN] action =", action, "by", req.user?.email);
 
   try {
+    // ==================== CREATE USER ====================
     if (action === "createUser") {
       const { email, password, fullName, role, orgId, departmentId } = data || {};
       if (!email || !password || !fullName || !role || !orgId) {
         return res.status(400).json({ error: "missing fields" });
       }
 
-      // Chỉ admin tạo trong org của mình; super có thể tạo bất kỳ
       const myRole = (req.me.role || "").toLowerCase();
       const myOrgId = req.me.orgId;
       if (myRole !== "superadmin" && orgId !== myOrgId) {
         return res.status(403).json({ error: "admin can only create in own org" });
       }
 
-      // Tạo Auth user
       const userRecord = await admin.auth().createUser({
         email,
         password,
@@ -88,7 +90,6 @@ app.post("/admin", authMiddleware, requireAdmin, async (req, res) => {
         disabled: false,
       });
 
-      // Tạo Firestore profile
       const payload = {
         uid: userRecord.uid,
         email,
@@ -103,70 +104,69 @@ app.post("/admin", authMiddleware, requireAdmin, async (req, res) => {
       return res.json({ uid: userRecord.uid });
     }
 
+    // ==================== UPDATE USER (profile) ====================
     if (action === "updateUser") {
       const { uid, ...rest } = data || {};
       if (!uid) return res.status(400).json({ error: "missing uid" });
-      // Nếu cập nhật org, kiểm tra quyền
+
       if (rest.orgId) {
         const myRole = (req.me.role || "").toLowerCase();
         if (myRole !== "superadmin" && rest.orgId !== req.me.orgId) {
           return res.status(403).json({ error: "admin can only move within own org" });
         }
       }
+
       await db.collection("users").doc(uid).set(rest, { merge: true });
-      if (rest.fullName) {
-        try { await admin.auth().updateUser(uid, { displayName: rest.fullName }); } catch (e) {}
-      }
-      if (rest.email) {
-        try { await admin.auth().updateUser(uid, { email: rest.email }); } catch (e) {}
-      }
+
+      try {
+        if (rest.fullName) await admin.auth().updateUser(uid, { displayName: rest.fullName });
+        if (rest.email) await admin.auth().updateUser(uid, { email: rest.email });
+      } catch (_) { /* ignore */ }
+
       return res.json({ ok: true });
     }
 
-    if (action === "setPassword") {
-  const { uid, password } = data || {};
-  if (!uid || !password) return res.status(400).json({ error: "missing uid/password" });
+    // ==================== SET/RESET PASSWORD ====================
+    // Chấp nhận nhiều alias để tránh lệch action giữa các bản app
+    if (action === "setPassword" || action === "resetPassword" || action === "adminResetPassword") {
+      const { uid, password, newPassword } = data || {};
+      const pwd = password || newPassword;
+      if (!uid || !pwd) return res.status(400).json({ error: "missing uid/password" });
 
-  // Lấy hồ sơ người gọi
-  const myRole = (req.me.role || "").toLowerCase();
-  const myOrg  = req.me.orgId || null;
+      const myRole = (req.me.role || "").toLowerCase();
+      const myOrg  = req.me.orgId || null;
 
-  // Lấy hồ sơ target trên Firestore
-  const targetDoc = await db.collection("users").doc(uid).get();
-  if (!targetDoc.exists) {
-    return res.status(404).json({ error: "user profile not found in Firestore" });
-  }
-  const target = targetDoc.data() || {};
+      const targetDoc = await db.collection("users").doc(uid).get();
+      if (!targetDoc.exists) {
+        return res.status(404).json({ error: "user profile not found in Firestore" });
+      }
+      const target = targetDoc.data() || {};
 
-  // Ràng buộc quyền: admin chỉ trong org của mình
-  if (myRole === "admin") {
-    if (!myOrg || target.orgId !== myOrg) {
-      return res.status(403).json({ error: "admin can only reset password within own org" });
+      if (myRole === "admin" && (!myOrg || target.orgId !== myOrg)) {
+        return res.status(403).json({ error: "admin can only reset password within own org" });
+      }
+
+      try {
+        await admin.auth().updateUser(uid, { password: pwd });
+        return res.json({ ok: true });
+      } catch (e) {
+        const s = String(e);
+        if (s.includes("auth/user-not-found")) {
+          return res.status(404).json({ error: "auth user not found" });
+        }
+        return res.status(500).json({ error: "updateUser failed", details: s });
+      }
     }
-  }
-  // superadmin: không giới hạn
 
-  try {
-    await admin.auth().updateUser(uid, { password });
-    return res.json({ ok: true });
-  } catch (e) {
-    // UID không tồn tại trên Firebase Auth?
-    if (String(e).includes("auth/user-not-found")) {
-      return res.status(404).json({ error: "auth user not found" });
-    }
-    return res.status(500).json({ error: "updateUser failed", details: String(e) });
-  }
-}
+    // ==================== DELETE USER ====================
     if (action === "deleteUser") {
       const { uid, cascade } = data || {};
       if (!uid) return res.status(400).json({ error: "missing uid" });
 
       await db.collection("users").doc(uid).delete();
-      // Xoá Auth (nếu muốn xoá luôn đăng nhập)
-      try { await admin.auth().deleteUser(uid); } catch (e) {}
+      try { await admin.auth().deleteUser(uid); } catch (_) {}
 
       if (cascade) {
-        // ví dụ: xoá schedules của uid
         const qs = await db.collection("schedules").where("createdBy", "==", uid).get();
         const batch = db.batch();
         qs.forEach(d => batch.delete(d.ref));
@@ -175,6 +175,7 @@ app.post("/admin", authMiddleware, requireAdmin, async (req, res) => {
       return res.json({ ok: true });
     }
 
+    // ==================== DEFAULT ====================
     return res.status(400).json({ error: "unknown action" });
   } catch (e) {
     console.error(e);
