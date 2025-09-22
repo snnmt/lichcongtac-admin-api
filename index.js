@@ -8,6 +8,7 @@ const app = express();
 app.use(cors());
 app.use(bodyParser.json({ limit: "1mb" }));
 
+// ----- Firebase Admin init -----
 if (!admin.apps.length) {
   admin.initializeApp({
     credential: admin.credential.cert({
@@ -24,8 +25,8 @@ const SUPER_ADMINS = (process.env.SUPER_ADMINS || "")
   .map(s => s.trim().toLowerCase())
   .filter(Boolean);
 
-// ===== NEW: public ping to warm server =====
-app.get("/ping", (_req, res) => res.json({ ok: true, ts: Date.now() }));
+// ----- tiện ích -----
+app.get("/ping", (_req, res) => res.json({ ok: true, ts: Date.now() })); // wake
 
 async function authMiddleware(req, res, next) {
   try {
@@ -58,12 +59,14 @@ async function requireAdmin(req, res, next) {
   }
 }
 
-// Health (có auth)
 app.get("/health", authMiddleware, (_req, res) => res.json({ ok: true }));
 
-app.post("/admin", authMiddleware, requireAdmin, async (req, res) => {
-  const { action, data } = req.body || {};
-  console.log("[ADMIN] action =", action, "by", req.user?.email);
+// ----- handler lõi dùng lại cho /admin và /admin/:action -----
+async function adminHandler(req, res) {
+  // Cho phép nhận action từ 3 nguồn để tránh sai khác phiên bản client:
+  const action = (req.params.action || (req.body || {}).action || req.query.action || "").trim();
+  const data = (req.body || {}).data || {};
+  console.log("[ADMIN]", { action, by: req.user?.email, dataKeys: Object.keys(data) });
 
   try {
     if (action === "createUser") {
@@ -106,8 +109,8 @@ app.post("/admin", authMiddleware, requireAdmin, async (req, res) => {
       return res.json({ ok: true });
     }
 
-    // Accept multiple aliases to avoid mismatch
-    if (action === "setPassword" || action === "resetPassword" || action === "adminResetPassword") {
+    // ----- ĐỔI MẬT KHẨU (nhiều alias) -----
+    if (["setPassword", "resetPassword", "adminResetPassword"].includes(action)) {
       const { uid, password, newPassword } = data || {};
       const pwd = password || newPassword;
       if (!uid || !pwd) return res.status(400).json({ error: "missing uid/password" });
@@ -151,8 +154,13 @@ app.post("/admin", authMiddleware, requireAdmin, async (req, res) => {
     console.error(e);
     return res.status(500).json({ error: "server error", details: String(e) });
   }
-});
+}
 
+// Nhận cả dạng body action lẫn path action:
+app.post("/admin", authMiddleware, requireAdmin, adminHandler);
+app.post("/admin/:action", authMiddleware, requireAdmin, adminHandler);
+
+// Kéo dài timeout tránh cold-start cắt sớm
 const server = app.listen(process.env.PORT || 3000, () => {
   console.log("Admin API listening on", server.address().port);
 });
