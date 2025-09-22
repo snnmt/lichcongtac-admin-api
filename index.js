@@ -1,49 +1,60 @@
 // index.js
+// Admin API cho Lịch Công Tác – Node/Express + Firebase Admin
+
 const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
 const bodyParser = require("body-parser");
 
 const app = express();
-app.use(cors({ origin: "*"}));
+app.use(cors());
 app.use(bodyParser.json({ limit: "1mb" }));
-
-// ===== ENV =====
-const {
-  FIREBASE_PROJECT_ID,
-  FIREBASE_CLIENT_EMAIL,
-  FIREBASE_PRIVATE_KEY,
-  SUPER_ADMINS = "",
-  PORT = 3000,
-} = process.env;
-
-if (!FIREBASE_PROJECT_ID || !FIREBASE_CLIENT_EMAIL || !FIREBASE_PRIVATE_KEY) {
-  console.error("[BOOT] Missing Firebase envs");
-  process.exit(1);
-}
 
 // ===== Firebase Admin init =====
 if (!admin.apps.length) {
   admin.initializeApp({
     credential: admin.credential.cert({
-      projectId: FIREBASE_PROJECT_ID,
-      clientEmail: FIREBASE_CLIENT_EMAIL,
-      privateKey: (FIREBASE_PRIVATE_KEY || "").replace(/\\n/g, "\n"),
+      projectId: process.env.FIREBASE_PROJECT_ID,
+      clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+      privateKey: (process.env.FIREBASE_PRIVATE_KEY || "").replace(/\\n/g, "\n"),
     }),
   });
 }
 const db = admin.firestore();
 const auth = admin.auth();
 
-const SUPER_ADMIN_EMAILS = SUPER_ADMINS
+// ===== Cấu hình super admin qua ENV =====
+const SUPER_ADMIN_EMAILS = (process.env.SUPER_ADMINS || "")
   .split(",")
   .map(s => s.trim().toLowerCase())
   .filter(Boolean);
 
 // ===== Helpers =====
-app.get("/", (_req, res) => res.type("text").send("lichcongtac-admin-api is running"));
-app.get("/ping", (_req, res) => res.json({ ok: true, ts: Date.now() }));
+const isSuperEmail = (email) => SUPER_ADMIN_EMAILS.includes((email || "").toLowerCase());
 
+async function isTargetSuperadmin(uid) {
+  // Lấy email từ Firebase Auth
+  let email = "";
+  try {
+    const u = await auth.getUser(uid);
+    email = (u.email || "").toLowerCase();
+  } catch (_) {}
+
+  // Lấy role từ Firestore (nếu có)
+  let role = "";
+  try {
+    const snap = await db.collection("users").doc(uid).get();
+    role = ((snap.exists ? snap.data() : {})?.role || "").toLowerCase();
+  } catch (_) {}
+
+  return role === "superadmin" || isSuperEmail(email);
+}
+
+// Ping/wake
+app.get("/ping", (_req, res) => res.json({ ok: true, ts: Date.now() }));
+app.get("/", (_req, res) => res.json({ service: "lichcongtac-admin-api", ok: true }));
+
+// Xác thực bằng Firebase ID token
 async function authMiddleware(req, res, next) {
   try {
     const hdr = req.headers.authorization || "";
@@ -55,37 +66,33 @@ async function authMiddleware(req, res, next) {
     req.user = decoded;
     next();
   } catch (e) {
-    res.status(401).json({ error: "invalid token", details: String(e) });
+    res.status(401).json({ error: "invalid token", details: String(e?.message || e) });
   }
 }
 
-// Chuẩn hoá vai trò hiệu lực: đọc profile, nếu email thuộc SUPER_ADMINS thì coi là superadmin
+// Yêu cầu quyền admin/superadmin
 async function requireAdmin(req, res, next) {
   try {
     const uid = req.user.uid;
-    const email = (req.user.email || "").toLowerCase();
-    const isSuperByEmail = SUPER_ADMIN_EMAILS.includes(email);
+    const meDoc = await db.collection("users").doc(uid).get();
+    const profile = meDoc.exists ? meDoc.data() : {};
+    const role = String(profile.role || "").toLowerCase();
+    const email = String(req.user.email || "").toLowerCase();
 
-    const meSnap = await db.collection("users").doc(uid).get();
-    const profile = meSnap.exists ? (meSnap.data() || {}) : {};
-    const roleDb = (profile.role || "").toLowerCase();
+    const isSuper = role === "superadmin" || isSuperEmail(email);
+    const isAdmin = isSuper || role === "admin";
 
-    const roleEffective = isSuperByEmail ? "superadmin" : roleDb; // ưu tiên qua env
-    const isAdminEffective =
-      roleEffective === "admin" || roleEffective === "superadmin";
+    if (!isAdmin) return res.status(403).json({ error: "forbidden" });
 
-    if (!isAdminEffective) {
-      return res.status(403).json({ error: "forbidden" });
-    }
-
-    // gắn thông tin đã chuẩn hoá cho downstream
+    // gắn thông tin lên req
     req.me = {
       ...profile,
+      role,
       email,
-      roleEffective,
-      isSuper: roleEffective === "superadmin",
+      isSuper,
+      isAdmin,
     };
-    return next();
+    next();
   } catch (e) {
     return res.status(500).json({ error: "auth check failed", details: String(e) });
   }
@@ -93,26 +100,27 @@ async function requireAdmin(req, res, next) {
 
 app.get("/health", authMiddleware, (_req, res) => res.json({ ok: true }));
 
-// ===== Core handler dùng cho /admin & /admin/:action =====
+// ====== Core handler dùng cho /admin và /admin/:action ======
 async function adminHandler(req, res) {
-  const action =
-    (req.params.action || (req.body || {}).action || req.query.action || "").trim();
-  const data = (req.body || {}).data || {};
+  const action = (req.params.action || req.body?.action || req.query?.action || "").trim();
+  const data = req.body?.data || {};
   console.log("[ADMIN]", { action, by: req.user?.email, dataKeys: Object.keys(data) });
 
   try {
-    // ---- CREATE USER ----
+    // ---------- CREATE USER ----------
     if (action === "createUser") {
       const { email, password, fullName, role, orgId, departmentId } = data || {};
       if (!email || !password || !fullName || !role || !orgId) {
         return res.status(400).json({ error: "missing fields" });
       }
 
-      // chỉ admin mới bị ràng buộc org; superadmin thì bỏ qua
+      // admin chỉ được tạo trong org của mình và KHÔNG được tạo superadmin/hoặc email thuộc SUPER_ADMIN_EMAILS
       if (!req.me.isSuper) {
-        const myOrgId = req.me.orgId;
-        if (!myOrgId || orgId !== myOrgId) {
+        if (!req.me.orgId || orgId !== req.me.orgId) {
           return res.status(403).json({ error: "admin can only create in own org" });
+        }
+        if (String(role).toLowerCase() === "superadmin" || isSuperEmail(email)) {
+          return res.status(403).json({ error: "admin cannot create superadmin" });
         }
       }
 
@@ -126,9 +134,9 @@ async function adminHandler(req, res) {
 
       const payload = {
         uid: userRecord.uid,
-        email,
+        email: (email || "").toLowerCase(),
         fullName,
-        role: (role || "user").toLowerCase(),
+        role: String(role || "user").toLowerCase(),
         orgId,
         departmentId: departmentId || null,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -137,12 +145,27 @@ async function adminHandler(req, res) {
       return res.json({ uid: userRecord.uid });
     }
 
-    // ---- UPDATE USER PROFILE/EMAIL/NAME ----
+    // ---------- UPDATE USER ----------
     if (action === "updateUser") {
       const { uid, ...rest } = data || {};
       if (!uid) return res.status(400).json({ error: "missing uid" });
 
-      // chỉ admin mới bị ràng buộc org; superadmin bỏ qua
+      // admin không được sửa superadmin
+      if (!req.me.isSuper && await isTargetSuperadmin(uid)) {
+        return res.status(403).json({ error: "cannot modify superadmin" });
+      }
+
+      // admin không được promote thành superadmin hoặc đổi email thành email superadmin
+      if (!req.me.isSuper) {
+        if (rest.role && String(rest.role).toLowerCase() === "superadmin") {
+          return res.status(403).json({ error: "cannot promote to superadmin" });
+        }
+        if (rest.email && isSuperEmail(rest.email)) {
+          return res.status(403).json({ error: "cannot set email of superadmin" });
+        }
+      }
+
+      // Giới hạn org khi admin cập nhật
       if (!req.me.isSuper && rest.orgId) {
         if (!req.me.orgId || rest.orgId !== req.me.orgId) {
           return res.status(403).json({ error: "admin can only move within own org" });
@@ -151,30 +174,34 @@ async function adminHandler(req, res) {
 
       await db.collection("users").doc(uid).set(rest, { merge: true });
       try {
-        if (rest.fullName) await auth.updateUser(uid, { displayName: rest.fullName });
-        if (rest.email) await auth.updateUser(uid, { email: rest.email });
+        const updates = {};
+        if (rest.fullName) updates.displayName = rest.fullName;
+        if (rest.email) updates.email = rest.email;
+        if (Object.keys(updates).length) await auth.updateUser(uid, updates);
       } catch (_) {}
       return res.json({ ok: true });
     }
 
-    // ---- RESET PASSWORD (alias) ----
+    // ---------- RESET/SET PASSWORD ----------
     if (["setPassword", "resetPassword", "adminResetPassword"].includes(action)) {
       const { uid, password, newPassword } = data || {};
       const pwd = password || newPassword;
       if (!uid || !pwd) return res.status(400).json({ error: "missing uid/password" });
 
-      const targetSnap = await db.collection("users").doc(uid).get();
+      // admin không được đổi mật khẩu superadmin
+      if (!req.me.isSuper && await isTargetSuperadmin(uid)) {
+        return res.status(403).json({ error: "cannot change password of superadmin" });
+      }
 
+      // Nếu là admin thường thì chỉ reset trong org của mình và chỉ khi có profile
       if (!req.me.isSuper) {
-        // admin: phải cùng org với target nếu target có profile
-        if (targetSnap.exists) {
-          const target = targetSnap.data() || {};
-          if (!req.me.orgId || target.orgId !== req.me.orgId) {
-            return res.status(403).json({ error: "admin can only reset password within own org" });
-          }
-        } else {
-          // target chưa có profile: admin thường không được phép
+        const targetSnap = await db.collection("users").doc(uid).get();
+        if (!targetSnap.exists) {
           return res.status(403).json({ error: "only superadmin can reset users without profile" });
+        }
+        const target = targetSnap.data() || {};
+        if (!req.me.orgId || target.orgId !== req.me.orgId) {
+          return res.status(403).json({ error: "admin can only reset password within own org" });
         }
       }
 
@@ -182,20 +209,25 @@ async function adminHandler(req, res) {
         await auth.updateUser(uid, { password: pwd });
         return res.json({ ok: true });
       } catch (e) {
-        const code = e?.code || "";
-        if (String(code).includes("auth/user-not-found")) {
+        const msg = String(e?.message || e);
+        if (msg.includes("auth/user-not-found")) {
           return res.status(404).json({ error: "auth user not found" });
         }
-        return res.status(500).json({ error: "updateUser failed", details: String(e?.message || e) });
+        return res.status(500).json({ error: "updateUser failed", details: msg });
       }
     }
 
-    // ---- DELETE USER ----
+    // ---------- DELETE USER ----------
     if (action === "deleteUser") {
       const { uid, cascade } = data || {};
       if (!uid) return res.status(400).json({ error: "missing uid" });
 
-      await db.collection("users").doc(uid).delete();
+      // admin không được xoá superadmin
+      if (!req.me.isSuper && await isTargetSuperadmin(uid)) {
+        return res.status(403).json({ error: "cannot delete superadmin" });
+      }
+
+      await db.collection("users").doc(uid).delete().catch(() => {});
       try { await auth.deleteUser(uid); } catch (_) {}
 
       if (cascade) {
@@ -207,10 +239,11 @@ async function adminHandler(req, res) {
       return res.json({ ok: true });
     }
 
+    // ---------- Unknown ----------
     return res.status(400).json({ error: "unknown action" });
   } catch (e) {
-    console.error("[ADMIN ERROR]", e);
-    return res.status(500).json({ error: "server error", details: String(e) });
+    console.error(e);
+    return res.status(500).json({ error: "server error", details: String(e?.message || e) });
   }
 }
 
@@ -218,8 +251,8 @@ async function adminHandler(req, res) {
 app.post("/admin", authMiddleware, requireAdmin, adminHandler);
 app.post("/admin/:action", authMiddleware, requireAdmin, adminHandler);
 
-// Kéo dài timeout tránh cold-start cắt sớm
-const server = app.listen(PORT, () => {
+// Kéo dài timeout tránh cold-start cắt sớm (Render free plan)
+const server = app.listen(process.env.PORT || 3000, () => {
   console.log("Admin API listening on", server.address().port);
 });
 server.setTimeout(120000);
