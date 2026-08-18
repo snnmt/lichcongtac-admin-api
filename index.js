@@ -254,5 +254,5 @@ app.post("/admin/:action", authMiddleware, requireAdmin, adminHandler);
 // Kéo dài timeout tránh cold-start cắt sớm (Render free plan)
 const server = app.listen(process.env.PORT || 3000, () => {
   console.log("Admin API listening on", server.address().port);
-});
+}); 
 server.setTimeout(120000);
